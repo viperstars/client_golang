@@ -15,11 +15,12 @@ package prometheus
 
 import (
 	"sort"
-	"sync/atomic"
+	"sync"
 
-	"github.com/cespare/xxhash/v2"
 	dto "github.com/prometheus/client_model/go"
 )
+
+var _ rawCollector = &CachedCollector{}
 
 // CachedCollector allows creating allocation friendly metrics which change less frequently than scrape time, yet
 // label values can are changing over time. This collector
@@ -28,15 +29,22 @@ import (
 // using CachedCollector instead.
 type CachedCollector struct {
 	descByFqName map[string]*Desc
+
+	cacheIndexByName map[string]int
+	cache            []*dto.MetricFamily
 }
 
+func (c *CachedCollector) Collect() []*dto.MetricFamily {
+	return c.cache
+}
 
+// NewSession allows to collect all metrics in one go and update cache as much in-place
+// as possible to save allocations.
 func (c *CachedCollector) NewSession() *CollectSession {
 	return &CollectSession{
 		fqnames: make([]string, 0, len(c.descByFqName)),
 	}
 }
-
 
 type CollectSession struct {
 	c *CachedCollector
@@ -68,79 +76,63 @@ func (d *Desc) isContentEqual(help string, variableLabels []string, constLabels 
 	return true
 }
 
-func (s *CollectSession) NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *Desc {
+func (s *CollectSession) Desc(fqName, help string, variableLabels []string, constLabels Labels) *Desc {
 	s.fqnames = append(s.fqnames, fqName)
-	if d, ok := s.c.descByFqName[fqName]; ok && d.isContentEqual(help, variableLabels, constLabels){
+	if d, ok := s.c.descByFqName[fqName]; ok && d.isContentEqual(help, variableLabels, constLabels) {
 		// Fast path if the same desc exists.
 		return d
 	}
 
 	// No need to allocate all from scratch, we could replace and validate.
-	s.c.descByFqName[fqName]= NewDesc(fqName, help, variableLabels, constLabels)
+	s.c.descByFqName[fqName] = NewDesc(fqName, help, variableLabels, constLabels)
 	return s.c.descByFqName[fqName]
 }
 
-// MustNewCachedMetric is a version of NewCachedMetric that panics where
-// NewCachedMetric would have returned an error.
-func MustNewCachedMetric(desc *Desc, valueType ValueType, value float64, labelValues ...string) Metric {
-	m, err := NewCachedMetric(desc, valueType, value, labelValues...)
-	if err != nil {
-		panic(err)
+type BlockingRegistry struct {
+	Gatherer
+
+	// rawCollector represents special collectors which requires blocking collect for the whole duration
+	// of returned dto.MetricFamily usage.
+	rawCollectors []rawCollector
+	mu            sync.Mutex
+}
+
+func NewBlockingRegistry(g Gatherer) *BlockingRegistry {
+	return &BlockingRegistry{
+		Gatherer: g,
 	}
-	return m
 }
 
-// NewCachedMetric returns a metric ...
-func NewCachedMetric(desc *Desc, valueType ValueType, value float64, labelValues ...string) (Metric, error) {
-	m, err := NewConstMetric(desc, valueType, value, labelValues...)
-	if err != nil {
-		return nil, err
-	}
-	d := &dto.Metric{}
-	if err := m.Write(d); err != nil {
-		return nil, err
-	}
-
-	return &cachedMetric{
-		desc: desc,
-		metric: d,
-	}, nil
+type rawCollector interface {
+	Collect() []*dto.MetricFamily
 }
 
-var _ IteratableGatherer = &cachedGatherer{}
-
-type cachedGatherer struct {
-	g Gatherer
-
-	pendingReaders atomic.Value
+func (b *BlockingRegistry) RegisterRaw(r rawCollector) error {
+	// TODO(bwplotka): Register, I guess for dups/check purposes?
+	b.rawCollectors = append(b.rawCollectors, r)
+	return nil
 }
 
-func newCachedGatherer(g Gatherer) *cachedGatherer {
-	return &cachedGatherer{g:g }
-}
+func (b *BlockingRegistry) Gather() (_ []*dto.MetricFamily, done func(), err error) {
+	mfs, err := b.Gatherer.Gather()
 
-// GatherIterate ...
-func(g *cachedGatherer) GatherIterate() (MetricFamilyIterator, error) {
-	mfs, err := g.g.Gather()
-	if err != nil {
-		return nil , err
+	b.mu.Lock()
+	// Returned mfs are sorted, so sort raw ones and inject
+	// TODO(bwplotka): Implement concurrency for those?
+	for _, r := range b.rawCollectors {
+		// TODO(bwplotka): Check for duplicates.
+		mfs = append(mfs, r.Collect()...)
 	}
 
-
-
-	return &mfIterator{mfs: mfs, i: -1}, err
+	// TODO(bwplotka): Consider sort in place, given metric family in gather is sorted already.
+	sort.Slice(mfs, func(i, j int) bool {
+		return *mfs[i].Name < *mfs[j].Name
+	})
+	return mfs, func() { b.mu.Unlock() }, err
 }
 
-// TODO(bwplotka): Consider making it public if useful.
-type synchronizedCollector interface {
-	SynchronizedCollect() *dto.MetricFamily
-
+// TransactionalGatherer ...
+type TransactionalGatherer interface {
+	// Gather ...
+	Gather() (_ []*dto.MetricFamily, done func(), err error)
 }
-
-type SynchronizedRegistry struct {
-	reg Gatherer
-}
-
-func
-
-GatherIterate() (MetricFamilyIterator, error)

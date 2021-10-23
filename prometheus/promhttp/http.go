@@ -40,6 +40,7 @@ import (
 	"sync"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -84,6 +85,19 @@ func Handler() http.Handler {
 // instrumentation. Use the InstrumentMetricHandler function to apply the same
 // kind of instrumentation as it is used by the Handler function.
 func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
+	return HandlerForTransactional(&noTransactionGatherer{g: reg}, opts)
+}
+
+type noTransactionGatherer struct {
+	reg prometheus.Gatherer
+}
+
+func (g *noTransactionGatherer) Gather() (_ []*dto.MetricFamily, done func(), err error) {
+	mfs, err := g.reg.Gather()
+	return mfs, func() {}, err
+}
+
+func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerOpts) http.Handler {
 	var (
 		inFlightSem chan struct{}
 		errCnt      = prometheus.NewCounterVec(
@@ -113,6 +127,7 @@ func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
 
 	h := http.HandlerFunc(func(rsp http.ResponseWriter, req *http.Request) {
 		if inFlightSem != nil {
+			// TODO(bwplotka): Implement single-flight which is essential for blocking TransactionalGatherer.
 			select {
 			case inFlightSem <- struct{}{}: // All good, carry on.
 				defer func() { <-inFlightSem }()
@@ -123,7 +138,8 @@ func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
 				return
 			}
 		}
-		mfs, err := reg.Gather()
+		mfs, done, err := reg.Gather()
+		defer done()
 		if err != nil {
 			if opts.ErrorLog != nil {
 				opts.ErrorLog.Println("error gathering metrics:", err)
