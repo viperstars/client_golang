@@ -38,6 +38,23 @@ const (
 	UntypedValue
 )
 
+var (
+	CounterMetricTypePtr = func() *dto.MetricType { d := dto.MetricType_COUNTER; return &d }()
+	GaugeMetricTypePtr   = func() *dto.MetricType { d := dto.MetricType_GAUGE; return &d }()
+	UntypedMetricTypePtr = func() *dto.MetricType { d := dto.MetricType_UNTYPED; return &d }()
+)
+
+func (v ValueType) ToDTO() *dto.MetricType {
+	switch v {
+	case CounterValue:
+		return CounterMetricTypePtr
+	case GaugeValue:
+		return GaugeMetricTypePtr
+	default:
+		return UntypedMetricTypePtr
+	}
+}
+
 // valueFunc is a generic metric for simple values retrieved on collect time
 // from a function. It implements Metric and Collector. Its effective type is
 // determined by ValueType. This is a low-level building block used by the
@@ -98,7 +115,7 @@ func NewConstMetric(desc *Desc, valueType ValueType, value float64, labelValues 
 	}
 
 	return &constMetric{
-		desc:       desc,
+		desc:   desc,
 		metric: metric,
 	}, nil
 }
@@ -114,7 +131,7 @@ func MustNewConstMetric(desc *Desc, valueType ValueType, value float64, labelVal
 }
 
 type constMetric struct {
-	desc *Desc
+	desc   *Desc
 	metric *dto.Metric
 }
 

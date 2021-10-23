@@ -85,7 +85,7 @@ func Handler() http.Handler {
 // instrumentation. Use the InstrumentMetricHandler function to apply the same
 // kind of instrumentation as it is used by the Handler function.
 func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
-	return HandlerForTransactional(&noTransactionGatherer{g: reg}, opts)
+	return HandlerForTransactional(&noTransactionGatherer{reg: reg}, opts)
 }
 
 type noTransactionGatherer struct {

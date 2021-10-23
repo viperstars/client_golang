@@ -14,9 +14,14 @@
 package prometheus
 
 import (
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 
+	"github.com/cespare/xxhash/v2"
+	"github.com/golang/protobuf/proto"
+	"github.com/prometheus/client_golang/prometheus/internal"
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -28,64 +33,142 @@ var _ rawCollector = &CachedCollector{}
 // If you happen to use NewDesc, NewConstMetric or MustNewConstMetric inside Collector.Collect routine, consider
 // using CachedCollector instead.
 type CachedCollector struct {
-	descByFqName map[string]*Desc
+	metrics            map[uint64]*dto.Metric
+	metricFamilyByName map[string]*dto.MetricFamily
 
-	cacheIndexByName map[string]int
-	cache            []*dto.MetricFamily
+	pendingSession bool
+}
+
+func NewCachedCollector() *CachedCollector {
+	return &CachedCollector{
+		metrics:            make(map[uint64]*dto.Metric),
+		metricFamilyByName: map[string]*dto.MetricFamily{},
+	}
 }
 
 func (c *CachedCollector) Collect() []*dto.MetricFamily {
-	return c.cache
+	// TODO(bwplotka): Optimize potential penalty here.
+	return internal.NormalizeMetricFamilies(c.metricFamilyByName)
 }
 
 // NewSession allows to collect all metrics in one go and update cache as much in-place
 // as possible to save allocations.
+// NOTE: Not concurrency safe and only one allowed at the time (until commit).
 func (c *CachedCollector) NewSession() *CollectSession {
+	c.pendingSession = true
 	return &CollectSession{
-		fqnames: make([]string, 0, len(c.descByFqName)),
+		c:              c,
+		currentMetrics: make(map[uint64]*dto.Metric, len(c.metrics)),
+		currentByName:  make(map[string]*dto.MetricFamily, len(c.metricFamilyByName)),
 	}
 }
 
 type CollectSession struct {
-	c *CachedCollector
+	closed bool
 
-	fqnames []string
+	c              *CachedCollector
+	currentMetrics map[uint64]*dto.Metric
+	currentByName  map[string]*dto.MetricFamily
 }
 
-func (d *Desc) isContentEqual(help string, variableLabels []string, constLabels Labels) bool {
-	if d.help != help {
-		return false
-	}
-	if len(d.variableLabels) != len(variableLabels) {
-		return false
-	}
-	if len(d.constLabelPairs) != len(constLabels) {
-		return false
-	}
-	for i := range d.variableLabels {
-		if d.variableLabels[i] != variableLabels[i] {
-			return false
-		}
-	}
-	for i := range d.constLabelPairs {
-		v, ok := constLabels[*d.constLabelPairs[i].Name]
-		if !ok || *d.constLabelPairs[i].Value != v {
-			return false
-		}
-	}
-	return true
+func (s *CollectSession) Commit() {
+	// TODO(bwplotka): Sort metrics within family.
+	s.c.metricFamilyByName = s.currentByName
+	s.c.metrics = s.currentMetrics
+
+	s.closed = true
+	s.c.pendingSession = false
 }
 
-func (s *CollectSession) Desc(fqName, help string, variableLabels []string, constLabels Labels) *Desc {
-	s.fqnames = append(s.fqnames, fqName)
-	if d, ok := s.c.descByFqName[fqName]; ok && d.isContentEqual(help, variableLabels, constLabels) {
-		// Fast path if the same desc exists.
-		return d
+// NewMetric ...
+// TODO(bwplotka): Add validation.
+func (s *CollectSession) NewMetric(fqName, help string, labelNames, labelValues []string, valueType ValueType, value float64) error {
+	if s.closed {
+		return errors.New("new metric: collect session is closed, but was attempted to be used")
 	}
 
-	// No need to allocate all from scratch, we could replace and validate.
-	s.c.descByFqName[fqName] = NewDesc(fqName, help, variableLabels, constLabels)
-	return s.c.descByFqName[fqName]
+	if !sort.StringsAreSorted(labelNames) {
+		return errors.New("new metric: label names has to be sorted")
+	}
+
+	if len(labelNames) != len(labelValues) {
+		return errors.New("new metric: label name has different len than values")
+	}
+
+	d, ok := s.c.metricFamilyByName[fqName]
+	if !ok {
+		// TODO(bwplotka): Validate?
+		d = &dto.MetricFamily{}
+		d.Name = proto.String(fqName)
+		d.Type = valueType.ToDTO()
+		d.Help = proto.String(help)
+	} else {
+		// TODO(bwplotka): Validate if same family.
+		d.Type = valueType.ToDTO()
+		d.Help = proto.String(help)
+	}
+	s.currentByName[fqName] = d
+
+	h := xxhash.New()
+	h.WriteString(fqName)
+	h.Write(separatorByteSlice)
+	for i := range labelNames {
+		h.WriteString(labelNames[i])
+		h.Write(separatorByteSlice)
+		h.WriteString(labelValues[i])
+		h.Write(separatorByteSlice)
+	}
+	hSum := h.Sum64()
+
+	m, ok := s.c.metrics[hSum]
+	if !ok {
+		m = &dto.Metric{
+			Label: make([]*dto.LabelPair, 0, len(labelNames)),
+		}
+		for i := range labelNames {
+			m.Label = append(m.Label, &dto.LabelPair{
+				Name:  proto.String(labelNames[i]),
+				Value: proto.String(labelValues[i]),
+			})
+		}
+		sort.Sort(labelPairSorter(m.Label))
+	}
+	s.currentMetrics[hSum] = m
+	switch valueType {
+	case CounterValue:
+		v := m.Counter
+		if v == nil {
+			v = &dto.Counter{}
+		}
+		v.Value = proto.Float64(value)
+		m.Counter = v
+		m.Gauge = nil
+		m.Untyped = nil
+	case GaugeValue:
+		v := m.Gauge
+		if v == nil {
+			v = &dto.Gauge{}
+		}
+		v.Value = proto.Float64(value)
+		m.Counter = nil
+		m.Gauge = v
+		m.Untyped = nil
+	case UntypedValue:
+		v := m.Untyped
+		if v == nil {
+			v = &dto.Untyped{}
+		}
+		v.Value = proto.Float64(value)
+		m.Counter = nil
+		m.Gauge = nil
+		m.Untyped = v
+	default:
+		return fmt.Errorf("unsupported value type %v", valueType)
+	}
+
+	// Will be sorted later.
+	d.Metric = append(d.Metric, m)
+	return nil
 }
 
 type BlockingRegistry struct {
@@ -113,11 +196,17 @@ func (b *BlockingRegistry) RegisterRaw(r rawCollector) error {
 	return nil
 }
 
+func (b *BlockingRegistry) MustRegisterRaw(r rawCollector) {
+	if err := b.RegisterRaw(r); err != nil {
+		panic(err)
+	}
+}
+
 func (b *BlockingRegistry) Gather() (_ []*dto.MetricFamily, done func(), err error) {
 	mfs, err := b.Gatherer.Gather()
 
 	b.mu.Lock()
-	// Returned mfs are sorted, so sort raw ones and inject
+	// TODO(bwplotka): Returned mfs are sorted, so sort raw ones and inject?
 	// TODO(bwplotka): Implement concurrency for those?
 	for _, r := range b.rawCollectors {
 		// TODO(bwplotka): Check for duplicates.
