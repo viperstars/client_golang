@@ -91,11 +91,15 @@ func NewConstMetric(desc *Desc, valueType ValueType, value float64, labelValues 
 	if err := validateLabelValues(labelValues, len(desc.variableLabels)); err != nil {
 		return nil, err
 	}
+
+	metric := &dto.Metric{}
+	if err := populateMetric(valueType, value, MakeLabelPairs(desc, labelValues), nil, metric); err != nil {
+		return nil, err
+	}
+
 	return &constMetric{
 		desc:       desc,
-		valType:    valueType,
-		val:        value,
-		labelPairs: MakeLabelPairs(desc, labelValues),
+		metric: metric,
 	}, nil
 }
 
@@ -110,10 +114,8 @@ func MustNewConstMetric(desc *Desc, valueType ValueType, value float64, labelVal
 }
 
 type constMetric struct {
-	desc       *Desc
-	valType    ValueType
-	val        float64
-	labelPairs []*dto.LabelPair
+	desc *Desc
+	metric *dto.Metric
 }
 
 func (m *constMetric) Desc() *Desc {
@@ -121,7 +123,11 @@ func (m *constMetric) Desc() *Desc {
 }
 
 func (m *constMetric) Write(out *dto.Metric) error {
-	return populateMetric(m.valType, m.val, m.labelPairs, nil, out)
+	out.Label = m.metric.Label
+	out.Counter = m.metric.Counter
+	out.Gauge = m.metric.Gauge
+	out.Untyped = m.metric.Untyped
+	return nil
 }
 
 func populateMetric(
