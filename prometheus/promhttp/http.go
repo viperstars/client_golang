@@ -40,7 +40,6 @@ import (
 	"sync"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -85,16 +84,7 @@ func Handler() http.Handler {
 // instrumentation. Use the InstrumentMetricHandler function to apply the same
 // kind of instrumentation as it is used by the Handler function.
 func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
-	return HandlerForTransactional(&noTransactionGatherer{reg: reg}, opts)
-}
-
-type noTransactionGatherer struct {
-	reg prometheus.Gatherer
-}
-
-func (g *noTransactionGatherer) Gather() (_ []*dto.MetricFamily, done func(), err error) {
-	mfs, err := g.reg.Gather()
-	return mfs, func() {}, err
+	return HandlerForTransactional(prometheus.ToTransactionalGatherer(reg), opts)
 }
 
 func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerOpts) http.Handler {

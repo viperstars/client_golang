@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/golang/protobuf/proto"
@@ -80,22 +81,34 @@ func (s *CollectSession) Commit() {
 	s.c.pendingSession = false
 }
 
-// NewMetric ...
+func (s *CollectSession) MustAddMetric(fqName, help string, labelNames, labelValues []string, valueType ValueType, value float64, ts *time.Time) {
+	if err := s.AddMetric(fqName, help, labelNames, labelValues, valueType, value, ts); err != nil {
+		panic(err)
+	}
+}
+
+// AddMetric ...
 // TODO(bwplotka): Add validation.
-func (s *CollectSession) NewMetric(fqName, help string, labelNames, labelValues []string, valueType ValueType, value float64) error {
+func (s *CollectSession) AddMetric(fqName, help string, labelNames, labelValues []string, valueType ValueType, value float64, ts *time.Time) error {
 	if s.closed {
 		return errors.New("new metric: collect session is closed, but was attempted to be used")
 	}
 
-	if !sort.StringsAreSorted(labelNames) {
-		return errors.New("new metric: label names has to be sorted")
-	}
+	// Label names can be unsorted, will be sorting them later. The only implication is cachability if
+	// consumer provide non-deterministic order of those (unlikely since label values has to be matched.
 
 	if len(labelNames) != len(labelValues) {
 		return errors.New("new metric: label name has different len than values")
 	}
 
-	d, ok := s.c.metricFamilyByName[fqName]
+	d, ok := s.currentByName[fqName]
+	if !ok {
+		d, ok = s.c.metricFamilyByName[fqName]
+		if ok {
+			d.Metric = d.Metric[:0]
+		}
+	}
+
 	if !ok {
 		// TODO(bwplotka): Validate?
 		d = &dto.MetricFamily{}
@@ -103,7 +116,7 @@ func (s *CollectSession) NewMetric(fqName, help string, labelNames, labelValues 
 		d.Type = valueType.ToDTO()
 		d.Help = proto.String(help)
 	} else {
-		// TODO(bwplotka): Validate if same family.
+		// TODO(bwplotka): Validate if same family?
 		d.Type = valueType.ToDTO()
 		d.Help = proto.String(help)
 	}
@@ -120,6 +133,9 @@ func (s *CollectSession) NewMetric(fqName, help string, labelNames, labelValues 
 	}
 	hSum := h.Sum64()
 
+	if _, ok := s.currentMetrics[hSum]; ok {
+		return fmt.Errorf("found duplicate metric (same labels and values) to add %v", fqName)
+	}
 	m, ok := s.c.metrics[hSum]
 	if !ok {
 		m = &dto.Metric{
@@ -166,13 +182,18 @@ func (s *CollectSession) NewMetric(fqName, help string, labelNames, labelValues 
 		return fmt.Errorf("unsupported value type %v", valueType)
 	}
 
+	m.TimestampMs = nil
+	if ts != nil {
+		m.TimestampMs = proto.Int64(ts.Unix()*1000 + int64(ts.Nanosecond()/1000000))
+	}
+
 	// Will be sorted later.
 	d.Metric = append(d.Metric, m)
 	return nil
 }
 
 type BlockingRegistry struct {
-	Gatherer
+	*Registry
 
 	// rawCollector represents special collectors which requires blocking collect for the whole duration
 	// of returned dto.MetricFamily usage.
@@ -180,9 +201,9 @@ type BlockingRegistry struct {
 	mu            sync.Mutex
 }
 
-func NewBlockingRegistry(g Gatherer) *BlockingRegistry {
+func NewBlockingRegistry() *BlockingRegistry {
 	return &BlockingRegistry{
-		Gatherer: g,
+		Registry: NewRegistry(),
 	}
 }
 
@@ -203,9 +224,9 @@ func (b *BlockingRegistry) MustRegisterRaw(r rawCollector) {
 }
 
 func (b *BlockingRegistry) Gather() (_ []*dto.MetricFamily, done func(), err error) {
-	mfs, err := b.Gatherer.Gather()
-
 	b.mu.Lock()
+	mfs, err := b.Registry.Gather()
+
 	// TODO(bwplotka): Returned mfs are sorted, so sort raw ones and inject?
 	// TODO(bwplotka): Implement concurrency for those?
 	for _, r := range b.rawCollectors {
@@ -224,4 +245,17 @@ func (b *BlockingRegistry) Gather() (_ []*dto.MetricFamily, done func(), err err
 type TransactionalGatherer interface {
 	// Gather ...
 	Gather() (_ []*dto.MetricFamily, done func(), err error)
+}
+
+func ToTransactionalGatherer(g Gatherer) TransactionalGatherer {
+	return &noTransactionGatherer{g: g}
+}
+
+type noTransactionGatherer struct {
+	g Gatherer
+}
+
+func (g *noTransactionGatherer) Gather() (_ []*dto.MetricFamily, done func(), err error) {
+	mfs, err := g.g.Gather()
+	return mfs, func() {}, err
 }
