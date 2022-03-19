@@ -16,6 +16,11 @@ package api
 
 import (
 	"context"
+	"errors"
+	ctxcopy "github.com/northbright/ctx/ctxcopy"
+	"github.com/valyala/bytebufferpool"
+	"github.com/viperstars/sharedcounter"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -110,20 +115,46 @@ func (c *httpClient) Do(ctx context.Context, req *http.Request) (*http.Response,
 
 	var body []byte
 	done := make(chan struct{})
-	go func() {
-		body, err = ioutil.ReadAll(resp.Body)
-		close(done)
-	}()
-
+	counter := ctx.Value("sharedCounter")
+	value, ok := counter.(*sharedcounter.SharedCounter)
+	if ok && value != nil {
+		go func() { // todo fast stop here
+			bb := bytebufferpool.Get()
+			counter := &Counter{Counter: value, Ctx: ctx}
+			buf := make([]byte, 2*1024*1024)
+			err = ctxcopy.Copy(ctx, bb, io.TeeReader(resp.Body, counter), buf)
+			if err == nil {
+				body = bb.Bytes()
+			}
+			buf = buf[:0]
+			bb.Reset()
+			close(done)
+			bytebufferpool.Put(bb)
+		}()
+	} else {
+		go func() {
+			body, err = ioutil.ReadAll(resp.Body)
+			close(done)
+		}()
+	}
 	select {
 	case <-ctx.Done():
 		<-done
-		err = resp.Body.Close()
-		if err == nil {
-			err = ctx.Err()
-		}
+		resp.Body.Close()
+		return nil, nil, errors.New("ctx canceled")
 	case <-done:
 	}
 
 	return resp, body, err
+}
+
+type Counter struct {
+	Counter *sharedcounter.SharedCounter
+	Ctx     context.Context
+}
+
+func (c *Counter) Write(p []byte) (int, error) {
+	length := len(p)
+	c.Counter.Add(int64(length))
+	return length, nil
 }
